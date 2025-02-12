@@ -1,0 +1,304 @@
+! git clone https://github.com/neuraloperator/CoDA-NO.git > /dev/null 2>&1
+! git clone https://github.com/NeuralOperator/neuraloperator > /dev/null 2>&1
+! pip install ./neuraloperator > /dev/null 2>&1
+! pip install -r ./neuraloperator/requirements.txt > /dev/null 2>&1
+
+import torch
+import matplotlib.pyplot as plt
+import sys
+from neuralop.layers.spherical_convolution import SphericalConv
+from neuralop.data.datasets import load_spherical_swe
+from neuralop.utils import count_model_params
+from neuralop import LpLoss, H1Loss
+
+import matplotlib.pyplot as plt
+
+train_loader, test_loaders = load_spherical_swe(n_train=200, batch_size=64, train_resolution=(32, 64),
+                                                test_resolutions=[(32, 64), (64, 128)], n_tests=[50, 50],
+                                                test_batch_sizes=[10, 10],)
+
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+for data in train_loader:
+    x = data['x']
+    y = data['y']
+
+    fig, axs = plt.subplots(1, 3, figsize=(18, 5), constrained_layout=True)
+
+    titles = [r'$v_x$ - Velocity (X)', r'$v_y$ - Velocity (Y)', r'$h$ - Fluid Height']
+    for i in range(3):
+        im = axs[i].imshow(x[0, i, :, :].detach().numpy(), cmap='jet', aspect='auto')
+        axs[i].set_title(titles[i], fontsize=14, fontweight='bold', pad=12)
+        axs[i].axis('off')  # Remove axis ticks for a cleaner look
+        cbar = fig.colorbar(im, ax=axs[i], fraction=0.046, pad=0.04)  # Add colorbar
+        cbar.ax.tick_params(labelsize=10)  # Adjust colorbar tick size
+
+    plt.suptitle("Shallow Water Equations - Input Variables", fontsize=16, fontweight='bold')
+    plt.show()
+    break
+
+
+from neuralop.models.codano import CODANO
+
+# List of input variable names
+V_id = ['v_x', 'v_y', 'h']
+
+# Initializing the CoDANO model
+model = CODANO(
+                1,  # Number of output channels per input variable. Since we have 3 input variables, the total output channels will be 3.
+
+                n_layers=4,  # Number of attention layers in the model.
+
+                n_modes=[[16, 16]] * 4,  # Number of Fourier modes used along each spatial dimension (latitude & longitude). Here, each layer uses 16 modes per dimension.
+
+                n_heads=[1] * 4,  # Number of attention heads per layer. We use 1 head for each of the 4 layers.
+
+                use_positional_encoding=True,  # Enables variable-specific positional encoding.
+
+                positional_encoding_modes=[16, 16],  # Number of Fourier modes used for positional encoding along each input dimension.
+
+                conv_module=SphericalConv,  # Since our problem is defined on a sphere, we use **Spherical Convolution**.
+
+                per_layer_scaling_factors=[[1, 1]] * 4,  # Output scaling factors for each layer along each dimension. To save memory, we could downsample latent functions if needed.
+
+                attention_scaling_factors=[1] * 4,  # Scaling factors for key and query downsampling in the attention mechanism.  Here, no downsampling is applied.
+
+                variable_ids=V_id  # List of variable names (3 variables in this case: v_x, v_y, h).
+            )
+
+
+
+from torch.optim import AdamW
+from torch.nn import MSELoss
+
+
+import torch
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import StepLR
+from torch.nn import MSELoss
+
+# Move model to GPU
+model = model.cuda()
+
+# Define optimizer (AdamW for better weight decay handling)
+optimizer = AdamW(model.parameters(), lr=1e-3)
+
+# Define learning rate scheduler (StepLR reduces LR every few epochs)
+scheduler = StepLR(optimizer, step_size=5, gamma=0.5)  # Halves LR every 5 epochs
+
+# Define loss function (Mean Squared Error)
+loss_fn = MSELoss()
+
+# Number of training epochs
+num_epochs = 5000
+
+# Training loop
+for epoch in range(num_epochs):
+    model.train()
+    total_loss = []
+
+    for i, data in enumerate(train_loader):
+        x = data['x']
+        y = data['y']
+
+        # Move tensors to GPU
+        x, y = x.cuda(), y.cuda()
+
+        # Zero the parameter gradients
+        optimizer.zero_grad()
+
+        # ⚠️ Note: We must provide `input_variable_ids` to specify variable order.
+        # The order in `input_variable_ids` **must match** the channel order in `x`.
+        output = model(x, input_variable_ids=V_id)
+
+        # Compute loss
+        loss = loss_fn(output, y)
+
+        # Backpropagation
+        loss.backward()
+        optimizer.step()
+
+        # Store loss for monitoring
+        total_loss.append(loss.item())
+
+    # Step the learning rate scheduler
+    scheduler.step()
+
+    # Print average loss for the epoch
+    avg_loss = sum(total_loss) / len(total_loss)
+    print(f'🔥 Epoch {epoch+1}/{num_epochs} | Loss: {avg_loss:.6f} | LR: {scheduler.get_last_lr()[0]:.6f}')
+
+
+
+for epoch in range(1):
+    model.train()
+    total_loss = []
+
+    for i, data in enumerate(train_loader):
+        x = data['x']
+        y = data['y']
+
+        # Move data to GPU
+        x, y = x.cuda(), y.cuda()
+
+        # Zero the gradients
+        optimizer.zero_grad()
+
+        # 📝 Discard the fluid height variable (h)
+        x = x[:, :2, :, :]  # Keep only the first two variables (v_x and v_y)
+        y = y[:, :2, :, :]  # Same for the target variable (output)
+
+        # Use the same model without any changes
+        out = model(x, input_variable_ids=['v_x', 'v_y'])  # Pass only 'v_x' and 'v_y'
+
+        # Compute the loss
+        loss = loss_fn(out, y)
+
+        # Backpropagate the loss
+        loss.backward()
+        optimizer.step()
+
+        # Track the total loss for the epoch
+        total_loss.append(loss.item())
+
+    # Print the average loss for the epoch
+    avg_loss = sum(total_loss) / len(total_loss)
+    print(f'Epoch {epoch+1}, Loss: {avg_loss:.6f}')
+
+
+
+model._extend_positional_encoding(['T'])
+
+for epoch in range(1):
+    model.train()
+    total_loss = []
+
+    for i, data in enumerate(train_loader):
+        x = data['x']
+        y = data['y']
+
+        # Move data to GPU
+        x, y = x.cuda(), y.cuda()
+
+        # Zero the gradients
+        optimizer.zero_grad()
+
+        # 📝 add new channel "T",
+        x = torch.cat((x, torch.zeros_like(x[:, :1, :, :])), dim=1)
+        y = torch.cat((y, torch.zeros_like(y[:, :1, :, :])), dim=1)
+
+        # Use the same model without any changes
+        out = model(x, input_variable_ids=['v_x', 'v_y', 'h', 'T'])  # codano assumes that the new channel is added at the end.
+
+        # Compute the loss
+        loss = loss_fn(out, y)
+
+        # Backpropagate the loss
+        loss.backward()
+        optimizer.step()
+
+        # Track the total loss for the epoch
+        total_loss.append(loss.item())
+
+    # Print the average loss for the epoch
+    avg_loss = sum(total_loss) / len(total_loss)
+    print(f'Epoch {epoch+1}, Loss: {avg_loss:.6f}')
+
+
+
+model = CODANO(1,
+                n_layers=5,
+                n_modes=[[16, 16]] * 5,
+                n_heads=[1] * 5,
+                use_positional_encoding=True,
+                positional_encoding_modes=[16, 16],
+                conv_module=SphericalConv,
+                per_layer_scaling_factors=[[1, 1], [0.5,0.5], [1, 1], [2,2,], [1,1]],
+                use_horizontal_skip_connection=True,
+                horizontal_skips_map= {4:0,3:1},
+                attention_scaling_factors=[1] * 5,
+                variable_ids=V_id
+            )
+# Explanation of key components:
+# - `per_layer_scaling_factors`: Specifies how the resolution of the feature maps is modified in each layer.
+#   - Layer 1 (index 0) downscales by a factor of 2 (scaling factor [0.5, 0.5]).
+#   - Layer 3 (index 2) upscales by a factor of 2 (scaling factor [2, 2]).
+#   - Other layers retain the resolution (scaling factor [1, 1]).
+#
+# - `horizontal_skips_map`: Defines horizontal skip connections between layers.
+#   - A skip connection is created from layer 0 to layer 4 and from layer 1 to layer 3.
+#     This improves information flow across the network, especially when capturing long-range dependencies.
+
+
+
+model = model.cuda()
+optimizer = AdamW(model.parameters(), lr=1e-3)
+
+scheduler = StepLR(optimizer, step_size=5, gamma=0.5)  # Halves LR every 5 epochs
+
+loss_fn = MSELoss()
+
+num_epochs = 10
+
+for epoch in range(num_epochs):
+    model.train()
+    total_loss = []
+
+    for i, data in enumerate(train_loader):
+        x = data['x']
+        y = data['y']
+        x, y = x.cuda(), y.cuda()
+        optimizer.zero_grad()
+        output = model(x, input_variable_ids=V_id)
+        loss = loss_fn(output, y)
+        loss.backward()
+        optimizer.step()
+        total_loss.append(loss.item())
+    scheduler.step()
+
+    avg_loss = sum(total_loss) / len(total_loss)
+    print(f'🔥 Epoch {epoch+1}/{num_epochs} | Loss: {avg_loss:.6f} | LR: {scheduler.get_last_lr()[0]:.6f}')
+
+
+
+
+import matplotlib.pyplot as plt
+import torch
+
+# Select a batch from the training data
+for i, data in enumerate(train_loader):
+    x = data['x']
+    y = data['y']
+
+    # Move data to GPU
+    x, y = x.cuda(), y.cuda()
+
+    # Get model output
+    model.eval()  # Set model to evaluation mode
+    with torch.no_grad():
+        output = model(x, input_variable_ids=['v_x', 'v_y', 'h'])
+
+    # Visualize comparison for the first input/output in the batch
+    fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+
+    # Ground truth visualization
+    axs[0].imshow(y[0, 0, :, :].cpu().numpy(), cmap='jet')
+    axs[0].set_title('Ground Truth - v_x')
+    axs[1].imshow(y[0, 1, :, :].cpu().numpy(), cmap='jet')
+    axs[1].set_title('Ground Truth - v_y')
+    axs[2].imshow(y[0, 2, :, :].cpu().numpy(), cmap='jet')
+    axs[2].set_title('Ground Truth - h')
+
+    # Model output visualization
+    fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+    axs[0].imshow(output[0, 0, :, :].cpu().numpy(), cmap='jet')
+    axs[0].set_title('Model Output - v_x')
+    axs[1].imshow(output[0, 1, :, :].cpu().numpy(), cmap='jet')
+    axs[1].set_title('Model Output - v_y')
+    axs[2].imshow(output[0, 2, :, :].cpu().numpy(), cmap='jet')
+    axs[2].set_title('Model Output - h')
+
+    plt.show()
+    break  # Exit after visualizing the first batch
