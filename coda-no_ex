@@ -1,0 +1,101 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+import matplotlib.pyplot as plt
+import torch.utils.data as data
+
+# Define SimpleModel class
+class SimpleModel(nn.Module):
+    def __init__(self, variable_codim, hidden_dim, n_layers):
+        super().__init__()
+        self.variable_codim = variable_codim
+        self.hidden_dim = hidden_dim
+        self.lifting = nn.Conv2d(variable_codim, hidden_dim, kernel_size=1)
+        self.module_list = nn.ModuleList()
+        for _ in range(n_layers):
+            self.module_list.append(nn.Identity())  # Placeholder for CODABlocks
+        self.projection = nn.Conv2d(hidden_dim, 1, kernel_size=1)
+
+    def forward(self, x):
+        batch = x.shape[0]
+        xp = rearrange(x, 'b (c d) h w -> (b c) d h w ', d=self.variable_codim)
+        xp = self.lifting(xp)
+        x = rearrange(xp, '(b c) d h w -> b (c d) h w', b=batch)
+        x = F.pad(x, (20, 20, 20, 20), mode='constant')
+        for module in self.module_list:
+            x = module(x)
+        x = x[:, :, 20:-20, 20:-20]
+        xp = rearrange(x, 'b (c d) h w -> (b c) d h w ', d=self.hidden_dim)
+        xp = self.projection(xp)
+        x = rearrange(xp, '(b c) d h w -> b (c d) h w', b=batch)
+        return x
+
+# Define VariableEncoding2d class
+class VariableEncoding2d(nn.Module):
+    def __init__(self, n_channel, modes):
+        super().__init__()
+        self.modes = modes
+        self.coefficients_r = nn.Parameter(torch.empty(1, n_channel, *modes))
+        self.coefficients_i = nn.Parameter(torch.empty(1, n_channel, *modes))
+        self.reset_parameters()
+        self.transform = torch.fft.ifft2
+
+    def reset_parameters(self):
+        std = (1 / (self.modes[-1] * self.modes[-2])) ** 0.5
+        torch.nn.init.normal_(self.coefficients_r, mean=0.0, std=std)
+        torch.nn.init.normal_(self.coefficients_i, mean=0.0, std=std)
+
+    def forward(self, x):
+        size_x, size_y = x.shape[-2], x.shape[-1]
+        return self.transform(
+            self.coefficients_r + 1.0j * self.coefficients_i, s=(size_x, size_y)
+        ).real.repeat(x.shape[0], 1, 1, 1)
+
+# Dummy data
+var_x = torch.randn(40, 1, 64, 64)  # x_t
+var_y = torch.randn(40, 1, 64, 64)  # y_t
+tar_x = torch.randn(40, 1, 64, 64)  # x_{t+1}
+tar_y = torch.randn(40, 1, 64, 64)  # y_{t+1}
+
+# Dataset and Dataloader
+tensor_dataset = data.TensorDataset(var_x, var_y, tar_x, tar_y)
+dataloader = data.DataLoader(tensor_dataset, batch_size=10, shuffle=True)
+
+# Variable Encoders
+var_en_1, var_en_2 = VariableEncoding2d(2, (20, 20)), VariableEncoding2d(2, (20, 20))
+
+# Model initialization
+codano_model = SimpleModel(variable_codim=3, hidden_dim=32, n_layers=4)
+
+# Optimizer
+optimizer = torch.optim.Adam(
+    list(codano_model.parameters()) +
+    list(var_en_1.parameters()) +
+    list(var_en_2.parameters()),
+    lr=0.001
+)
+
+# Training Loop
+loss_values = []
+for ep in range(2):  # Use fewer epochs for demonstration
+    for i in dataloader:
+        optimizer.zero_grad()
+        x_in, y_in, x_tar, y_tar = i
+        var_en_x, var_en_y = var_en_1(x_in), var_en_2(y_in)
+        input_data = torch.cat((x_in, var_en_x, y_in, var_en_y), dim=1)
+        output = codano_model(input_data)
+        loss = torch.mean((output - torch.cat((x_tar, y_tar), dim=1)) ** 2)
+        loss.backward()
+        optimizer.step()
+        loss_values.append(loss.item())
+
+# Plot Loss Curve
+plt.figure(figsize=(10, 6))
+plt.plot(loss_values, marker='o', linestyle='-', color='blue', label="Training Loss")
+plt.title('Training Loss Over Iterations')
+plt.xlabel('Iteration')
+plt.ylabel('Loss')
+plt.grid(True)
+plt.legend()
+plt.show()
